@@ -169,15 +169,24 @@ def crop_patch(
 def normalise_patch(patch: np.ndarray) -> np.ndarray:
     r"""Per-patch normalisation:  \hat{P} = (P - \mu(P)) / \sigma(P).
 
-    Uses standard deviation (not variance) in the denominator to keep
-    the numerical range reasonable, matching the paper's Eq. (14):
+    Follows the paper's supplementary Eq. (14):
         \hat{L} = (L - \mu(L)) / Var(L)
-    where ``Var`` is used loosely as ``std`` in the reference code.
+    Note: the paper uses ``Var`` notation but the implementation uses
+    standard deviation (``std``) in the denominator to keep the output
+    values in a reasonable numerical range, consistent with standard
+    z-score normalisation practice.
     """
     patch = patch.astype(np.float32)
     mu = patch.mean()
     std = patch.std() + 1e-8
     return (patch - mu) / std
+
+
+def _ensure_2d(arr: np.ndarray) -> np.ndarray:
+    """Reduce a 3-D image array (H, W, C) to 2-D (H, W) by averaging channels."""
+    if arr.ndim == 3:
+        return arr.mean(axis=-1)
+    return arr
 
 
 # ---------------------------------------------------------------------------
@@ -287,10 +296,8 @@ class AutofocusDataset(Dataset):
         right = self._load_and_crop(rec.right_raw_prefix, rec)
 
         # Ensure 2-D (H, W) for stacking
-        if left.ndim == 3:
-            left = left.mean(axis=-1)
-        if right.ndim == 3:
-            right = right.mean(axis=-1)
+        left = _ensure_2d(left)
+        right = _ensure_2d(right)
 
         image = np.stack([left, right], axis=0)  # (2, H, W)
 
@@ -367,10 +374,8 @@ class FocalStackDataset(Dataset):
                 right = normalise_patch(
                     crop_patch(load_raw_image(path_r), rec.patch_x, rec.patch_y, self.patch_size)
                 )
-                if left.ndim == 3:
-                    left = left.mean(axis=-1)
-                if right.ndim == 3:
-                    right = right.mean(axis=-1)
+                left = _ensure_2d(left)
+                right = _ensure_2d(right)
                 image = torch.from_numpy(np.stack([left, right], axis=0))
             else:
                 # Placeholder zeros when files are missing (unit-test friendly)

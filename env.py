@@ -32,6 +32,7 @@ from gymnasium import spaces
 from dataset import (
     AutofocusRecord,
     NUM_FOCUS_POSITIONS,
+    _ensure_2d,
     crop_patch,
     lens_position_encoding,
     load_raw_image,
@@ -152,12 +153,8 @@ class AutofocusEnv(gym.Env):
         path_l = os.path.join(self.data_root, rec.left_raw_prefix + self.raw_suffix)
         path_r = os.path.join(self.data_root, rec.right_raw_prefix + self.raw_suffix)
         try:
-            left = normalise_patch(crop_patch(load_raw_image(path_l), px, py, self.patch_size))
-            right = normalise_patch(crop_patch(load_raw_image(path_r), px, py, self.patch_size))
-            if left.ndim == 3:
-                left = left.mean(axis=-1)
-            if right.ndim == 3:
-                right = right.mean(axis=-1)
+            left = _ensure_2d(normalise_patch(crop_patch(load_raw_image(path_l), px, py, self.patch_size)))
+            right = _ensure_2d(normalise_patch(crop_patch(load_raw_image(path_r), px, py, self.patch_size)))
             image = torch.from_numpy(np.stack([left, right], axis=0))
         except Exception:
             image = torch.zeros(2, self.patch_size, self.patch_size)

@@ -53,6 +53,9 @@ from trajectory_builder import (
     FlatStep,
 )
 
+# Tolerance for matching focus indices when looking up expert actions
+FOCUS_INDEX_MATCH_TOLERANCE = 1
+
 
 # ---------------------------------------------------------------------------
 # PPO rollout buffer
@@ -323,7 +326,7 @@ def sample_expert_action(
             entry.scene_name == scene_name
             and entry.patch_x == patch_x
             and entry.patch_y == patch_y
-            and abs(entry.focus_index - focus_index) <= 1
+            and abs(entry.focus_index - focus_index) <= FOCUS_INDEX_MATCH_TOLERANCE
             and entry.step_in_traj == step_in_traj
         ):
             # Convert expert_action (offset) to action index

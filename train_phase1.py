@@ -56,9 +56,10 @@ def ordinal_target(
 ) -> torch.Tensor:
     """Build the soft ordinal-regression target distribution.
 
-    For each sample, the target rank is the *relative movement*
-    ``gt_focus_index - focus_index`` mapped into the range
-    ``[0, num_positions - 1]``.
+    During pretraining, the target rank is the *absolute* GT focus position
+    (``gt_focus_index``), so the model learns to predict absolute positions.
+    When transitioning to RL (Phase 2), the output head is changed to
+    predict relative movements instead.
 
     Parameters
     ----------
