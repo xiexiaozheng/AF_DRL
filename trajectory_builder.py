@@ -171,9 +171,9 @@ def algorithm1(
             (i for i, r in enumerate(stack) if r.focus_index >= valid_lo_pos), 0
         )
         valid_end_idx = next(
-            (i for i, r in enumerate(stack) if r.focus_index > valid_hi_pos),
-            len(stack),
-        ) - 1
+            (i - 1 for i, r in enumerate(stack) if r.focus_index > valid_hi_pos),
+            len(stack) - 1,
+        )
         valid_end_idx = max(valid_start_idx, valid_end_idx)
 
         indices = np.linspace(valid_start_idx, valid_end_idx, n_total, dtype=int)
@@ -193,7 +193,7 @@ def algorithm1(
         # Force the last waypoint to GT so the trajectory always ends exactly
         # at the ground-truth focus position (last action = 0, i.e. stop).
         reverse = k0 > gt  # descending if starting above GT
-        mirrored[-1] = float(gt)
+        mirrored[-1] = gt
         mirrored.sort(reverse=reverse)
 
         # Step 5: build trajectory
