@@ -103,14 +103,21 @@ def algorithm1(
     """Generate expert trajectories by mirroring and re-sorting.
 
     For every record in *stack* used as a starting position:
-      1. Select *n_steps + 1* positions from the stack (the initial
-         position plus *n_steps* subsequent ones, wrapping if needed).
+      1. Select *n_steps + 1* positions from the stack, sampling only
+         within the useful overshooting range [k_0, 2·GT − k_0] (or
+         [2·GT − k_0, k_0] when k_0 > GT).  Positions outside this
+         symmetric window around GT would collapse to k_0 after
+         mirroring and clipping, so restricting to this range avoids
+         degenerate trajectories.
       2. For each position *k_j*, compute the mirrored position:
              o_j = sign(k_0 - GT) · |k_j - GT| + GT
          This "reflects" any position that overshot GT back across GT.
       3. Clip each o_j to [min(k_0, GT), max(k_0, GT)].
-      4. Sort the resulting positions monotonically towards GT.
-      5. Derive actions as differences between consecutive positions.
+      4. Force the last waypoint to GT so the trajectory always ends
+         exactly at the ground-truth focus position.
+      5. Sort the resulting positions monotonically towards GT.
+      6. Derive actions as differences between consecutive positions;
+         the final action is 0 (stop at GT).
 
     Returns one trajectory per starting position in the stack.
     """
@@ -144,26 +151,49 @@ def algorithm1(
             continue
 
         sign_k0 = 1 if k0 > gt else -1
+        lo, hi = min(k0, gt), max(k0, gt)
 
-        # Collect n_steps+1 positions from the stack (starting from k0)
-        # Use evenly-spaced indices in the stack for diversity.
+        # Collect n_steps+1 positions from the stack (starting from k0).
+        # Only sample within the useful overshooting range: the mirror of k0
+        # through GT is 2*gt - k0.  Positions beyond that boundary would clip
+        # to k0 after mirroring, creating degenerate collapsed trajectories.
         n_total = n_steps + 1
-        indices = np.linspace(0, len(stack) - 1, n_total, dtype=int)
-        # Ensure the first one is the starting record
+        overshoot_limit = 2 * gt - k0  # symmetric mirror of k0 across GT
+        if k0 < gt:
+            valid_lo_pos = k0
+            valid_hi_pos = min(overshoot_limit, NUM_FOCUS_POSITIONS - 1)
+        else:
+            valid_lo_pos = max(overshoot_limit, 0)
+            valid_hi_pos = k0
+
+        # Map valid focus-position range to sorted-stack indices
+        valid_start_idx = next(
+            (i for i, r in enumerate(stack) if r.focus_index >= valid_lo_pos), 0
+        )
+        valid_end_idx = next(
+            (i for i, r in enumerate(stack) if r.focus_index > valid_hi_pos),
+            len(stack),
+        ) - 1
+        valid_end_idx = max(valid_start_idx, valid_end_idx)
+
+        indices = np.linspace(valid_start_idx, valid_end_idx, n_total, dtype=int)
+        # The first position is always the starting record k0
         raw_positions = [k0]
         for idx in indices[1:]:
             raw_positions.append(stack[idx].focus_index)
 
         # Step 2 & 3: mirror & clip
-        lo, hi = min(k0, gt), max(k0, gt)
         mirrored = []
         for kj in raw_positions:
             oj = sign_k0 * abs(kj - gt) + gt
             oj = max(lo, min(oj, hi))
             mirrored.append(oj)
 
-        # Step 4: sort monotonically towards GT
+        # Step 4: sort monotonically towards GT.
+        # Force the last waypoint to GT so the trajectory always ends exactly
+        # at the ground-truth focus position (last action = 0, i.e. stop).
         reverse = k0 > gt  # descending if starting above GT
+        mirrored[-1] = float(gt)
         mirrored.sort(reverse=reverse)
 
         # Step 5: build trajectory
