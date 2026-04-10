@@ -1,18 +1,22 @@
 """
 evaluation.py – Shared evaluation helpers for phase 1 and phase 2.
+
+The helpers in this module compute the paper's autofocus metrics
+(`<=0/1/2/4`, MAE, RMSE, focus hunting rate, and focus speed) for both
+single-step actor checkpoints and multi-step rollout-based models. It
+also stores rollout traces so testing runs can be inspected offline.
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
-from math import sqrt
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
 
-from dataset import DEFAULT_PATCH_SIZE, group_focal_stacks, parse_txt
+from dataset import DEFAULT_PATCH_SIZE, NUM_FOCUS_POSITIONS, group_focal_stacks, parse_txt
 from models import ACTION_RANGE, AutofocusActorCritic
 from trajectory_builder import build_state_from_record, _find_nearest_focus, _find_nearest_record
 
@@ -70,7 +74,7 @@ def evaluate_phase1_model(
         with torch.no_grad():
             action_index = model.actor_logits(state).argmax(dim=-1)
         offset = int(action_index.item()) - ACTION_RANGE
-        predicted_stop = int(np.clip(record.focus_index + offset, 0, ACTION_RANGE))
+        predicted_stop = int(np.clip(record.focus_index + offset, 0, NUM_FOCUS_POSITIONS - 1))
         errors.append(abs(predicted_stop - record.gt_focus_index))
     return compute_error_metrics(errors)
 
@@ -116,7 +120,7 @@ def rollout_actor_on_txt(
                     else:
                         action_index = torch.distributions.Categorical(logits=logits).sample()
                 offset = int(action_index.item()) - ACTION_RANGE
-                next_focus = int(np.clip(current_focus + offset, 0, ACTION_RANGE))
+                next_focus = int(np.clip(current_focus + offset, 0, NUM_FOCUS_POSITIONS - 1))
                 next_focus = _find_nearest_focus(stack, next_focus)
                 action = next_focus - current_focus
                 actions.append(action)
@@ -128,6 +132,7 @@ def rollout_actor_on_txt(
                     prev_direction = direction
                 if hit_gt_step is None and next_focus == gt:
                     hit_gt_step = step_idx + 1
+                    break
                 current_focus = next_focus
             traces.append(
                 RolloutTrace(
@@ -150,7 +155,7 @@ def summarise_rollouts(traces: Sequence[RolloutTrace], max_steps: int) -> Dict[s
     errors = [abs(trace.positions[-1] - trace.gt_focus_index) for trace in traces]
     metrics = compute_error_metrics(errors)
     metrics["fh"] = float(np.mean([trace.focus_hunting for trace in traces])) if traces else 0.0
-    metrics["avg_focus_speed"] = float(
+    metrics["avg_steps_to_gt"] = float(
         np.mean([trace.hit_gt_step if trace.hit_gt_step is not None else max_steps + 1 for trace in traces])
     ) if traces else 0.0
     return metrics

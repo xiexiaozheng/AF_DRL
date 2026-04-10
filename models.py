@@ -4,6 +4,7 @@ models.py – Paper-faithful actor-critic network for AF_DRL.
 
 from __future__ import annotations
 
+import sys
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -17,6 +18,9 @@ except ImportError:  # pragma: no cover
 
 from dataset import NUM_FOCUS_POSITIONS
 
+# The paper expands the action space to [-kmax, kmax], where kmax is the
+# maximum discrete focus index. With 70 focus positions indexed as 0..69,
+# this yields 139 relative-movement bins.
 ACTION_RANGE = NUM_FOCUS_POSITIONS - 1
 ACTION_DIM = 2 * ACTION_RANGE + 1
 
@@ -28,7 +32,9 @@ def _build_backbone(imagenet_pretrained: bool) -> nn.Module:
         weights = MobileNet_V2_Weights.DEFAULT
     try:
         return mobilenet_v2(weights=weights)
-    except Exception:
+    except (RuntimeError, ValueError, TypeError):
+        if weights is not None:
+            print("Warning: failed to load ImageNet-pretrained MobileNetV2 weights; falling back to random init.", file=sys.stderr)
         return mobilenet_v2(weights=None)
 
 

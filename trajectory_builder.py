@@ -1,5 +1,11 @@
 """
-trajectory_builder.py – Exact expert trajectory generation pipeline.
+trajectory_builder.py – Paper-faithful expert trajectory generation.
+
+This module first rolls out the phase-1 actor on every focal stack to
+obtain the original multi-step trajectories used as input to the paper's
+trajectory refinement pipeline. It then applies Algorithm 1, Algorithm 2,
+and Algorithm 3 exactly at the trajectory level to build the offline
+expert dataset used before phase-2 PPO training.
 """
 
 from __future__ import annotations
@@ -63,10 +69,17 @@ def _find_nearest_record(stack: List[AutofocusRecord], target_focus: int) -> Aut
     return min(stack, key=lambda rec: abs(rec.focus_index - target_focus))
 
 
-
 def _find_nearest_focus(stack: List[AutofocusRecord], target_focus: int) -> int:
     return _find_nearest_record(stack, target_focus).focus_index
 
+
+def _nearest_bank_step(record_bank: Dict[int, StepData], target_focus: int, fallback: StepData) -> StepData:
+    if not record_bank:
+        return fallback
+    if target_focus in record_bank:
+        return record_bank[target_focus]
+    nearest_focus = min(record_bank.keys(), key=lambda focus: abs(focus - target_focus))
+    return record_bank[nearest_focus]
 
 
 def build_state_from_record(
@@ -78,8 +91,12 @@ def build_state_from_record(
 ) -> Dict[str, torch.Tensor]:
     left_path = os.path.join(data_root, record.left_raw_prefix + raw_suffix)
     right_path = os.path.join(data_root, record.right_raw_prefix + raw_suffix)
-    left = _ensure_2d(normalise_patch(crop_patch(load_raw_image(left_path), record.patch_x, record.patch_y, patch_size)))
-    right = _ensure_2d(normalise_patch(crop_patch(load_raw_image(right_path), record.patch_x, record.patch_y, patch_size)))
+    left_image = load_raw_image(left_path)
+    right_image = load_raw_image(right_path)
+    left_patch = crop_patch(left_image, record.patch_x, record.patch_y, patch_size)
+    right_patch = crop_patch(right_image, record.patch_x, record.patch_y, patch_size)
+    left = _ensure_2d(normalise_patch(left_patch))
+    right = _ensure_2d(normalise_patch(right_patch))
     image = torch.from_numpy(np.stack([left, right], axis=0)).float()
     lens_pe = torch.from_numpy(lens_position_encoding(record.focus_index, embed_dim=pe_dim)).float()
     roi_pe = torch.from_numpy(roi_position_encoding(record.patch_x, record.patch_y, embed_dim=pe_dim)).float()
@@ -142,7 +159,8 @@ def rollout_policy_trajectory(
         state = {key: value.unsqueeze(0).to(device) for key, value in state.items()}
         with torch.no_grad():
             logits = model.actor_logits(state)
-            action_index = logits.argmax(dim=-1) if deterministic else torch.distributions.Categorical(logits=logits).sample()
+            dist = torch.distributions.Categorical(logits=logits)
+            action_index = logits.argmax(dim=-1) if deterministic else dist.sample()
         offset = int(action_index.item()) - ACTION_RANGE
         next_focus = int(np.clip(current_focus + offset, 0, NUM_FOCUS_POSITIONS - 1))
         next_focus = _find_nearest_focus(stack, next_focus)
@@ -225,6 +243,11 @@ def algorithm1(original: ExpertTrajectory) -> ExpertTrajectory:
         mirrored = int(np.clip(mirrored, lower, upper))
         reflected.append(mirrored)
     reflected = sorted(reflected, reverse=(k0 > gt))
+    if len(reflected) != len(original.steps):
+        raise ValueError(
+            f"Algorithm 1 requires mirrored positions and original steps to have the same length "
+            f"(got {len(reflected)} vs {len(original.steps)})."
+        )
 
     expert = ExpertTrajectory(
         scene_name=original.scene_name,
@@ -237,7 +260,7 @@ def algorithm1(original: ExpertTrajectory) -> ExpertTrajectory:
     for index, step in enumerate(original.steps):
         focus_index = reflected[index]
         action = reflected[index + 1] - focus_index if index < len(reflected) - 1 else 0
-        bank_step = original.record_bank.get(focus_index, step)
+        bank_step = _nearest_bank_step(original.record_bank, focus_index, step)
         expert.steps.append(
             StepData(
                 focus_index=focus_index,
@@ -269,7 +292,11 @@ def algorithm2(original: ExpertTrajectory) -> ExpertTrajectory:
     for index, step in enumerate(original.steps):
         focus_index = k0 if index == 0 else gt
         action = (gt - k0) if index == 0 else 0
-        source_step = original.record_bank.get(focus_index, original.steps[min(index, len(original.steps) - 1)])
+        source_step = _nearest_bank_step(
+            original.record_bank,
+            focus_index,
+            original.steps[min(index, len(original.steps) - 1)],
+        )
         expert.steps.append(
             StepData(
                 focus_index=focus_index,
@@ -296,6 +323,11 @@ def algorithm3(original: ExpertTrajectory, m: int = 5) -> ExpertTrajectory:
         distance = int(distance / m)
         positions.append(gt + distance)
     positions.append(gt)
+    if len(positions) != len(original.steps):
+        raise ValueError(
+            f"Algorithm 3 requires generated positions and original steps to have the same length "
+            f"(got {len(positions)} vs {len(original.steps)})."
+        )
 
     expert = ExpertTrajectory(
         scene_name=original.scene_name,
@@ -308,7 +340,7 @@ def algorithm3(original: ExpertTrajectory, m: int = 5) -> ExpertTrajectory:
     for index, step in enumerate(original.steps):
         focus_index = int(np.clip(positions[index], 0, NUM_FOCUS_POSITIONS - 1))
         action = positions[index + 1] - focus_index if index < len(positions) - 1 else 0
-        source_step = original.record_bank.get(focus_index, step)
+        source_step = _nearest_bank_step(original.record_bank, focus_index, step)
         expert.steps.append(
             StepData(
                 focus_index=focus_index,

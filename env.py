@@ -61,7 +61,8 @@ class AutofocusEnv(gym.Env):
         return min(available, key=lambda focus: abs(focus - target))
 
     def _get_state_dict(self, focus_index: int) -> Dict[str, torch.Tensor]:
-        scene, patch_x, patch_y = self._current_stack_key  # type: ignore[misc]
+        assert self._current_stack_key is not None
+        scene, patch_x, patch_y = self._current_stack_key
         rec = self.record_index.get((scene, patch_x, patch_y, focus_index))
         if rec is None:
             rec = self.record_index[(scene, patch_x, patch_y, self._find_nearest_focus(focus_index))]
