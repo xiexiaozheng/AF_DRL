@@ -1,480 +1,520 @@
 """
-trajectory_builder.py – Offline Expert Trajectory Generation
-=============================================================
+trajectory_builder.py – Paper-faithful expert trajectory generation.
 
-Implements the three expert trajectory generation algorithms described
-in the paper's supplementary material:
-
-  • **Algorithm 1** – Fix overshooting / focus-hunting trajectories by
-    mirroring positions that crossed the GT back into a valid interval,
-    then re-sorting to guarantee monotonicity.
-
-  • **Algorithm 2** – For difficult / textureless scenes: keep the
-    initial position, then jump directly to GT for all subsequent
-    steps ("one-step-to-GT").
-
-  • **Algorithm 3** – Smooth decaying approach: divide the initial
-    distance *d* by a factor *m* at each step, yielding a progressively
-    smaller step size that converges to GT.
-
-All three algorithms produce state–action expert trajectories
-``(s_0, a_0), ..., (s_n, a_n)`` where ``a_t = k_{t+1} - k_t`` is the
-relative lens movement and ``a_n = 0`` (stop).
-
-Public API
-----------
-``build_expert_trajectories(records, ...)``
-    Main entry-point.  Takes the parsed TXT records, iterates over all
-    focal stacks, and returns a list of ``ExpertTrajectory`` objects.
+This module first rolls out the phase-1 actor on every focal stack to
+obtain the original multi-step trajectories used as input to the paper's
+trajectory refinement pipeline. It then applies Algorithm 1, Algorithm 2,
+and Algorithm 3 exactly at the trajectory level to build the offline
+expert dataset used before phase-2 PPO training.
 """
 
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+import argparse
+import json
+import os
+from dataclasses import asdict, dataclass, field
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
+import torch
+from torch.utils.data import Dataset
 
 from dataset import (
+    DEFAULT_PATCH_SIZE,
     AutofocusRecord,
-    group_focal_stacks,
-    parse_txt,
     NUM_FOCUS_POSITIONS,
+    _ensure_2d,
+    crop_patch,
+    group_focal_stacks,
+    lens_position_encoding,
+    load_raw_image,
+    normalise_patch,
+    parse_txt,
+    roi_position_encoding,
 )
+from models import ACTION_DIM, ACTION_RANGE, AutofocusActorCritic
 
-# ---------------------------------------------------------------------------
-# Data structures
-# ---------------------------------------------------------------------------
 
 @dataclass
 class StepData:
-    """A single (state-descriptor, action) pair in a trajectory."""
-    focus_index: int            # lens position at this step
-    action: int                 # relative movement  a_t = k_{t+1} - k_t
-    gt_focus_index: int
-    scene_name: str = ""
-    patch_x: int = 0
-    patch_y: int = 0
-    temperature: float = 0.0
-    left_raw_prefix: str = ""
-    right_raw_prefix: str = ""
-
-
-@dataclass
-class ExpertTrajectory:
-    """A complete expert trajectory of length *n_steps + 1*."""
-    scene_name: str
-    patch_x: int
-    patch_y: int
-    gt_focus_index: int
-    steps: List[StepData] = field(default_factory=list)
-    algo_id: int = 0           # which algorithm generated this
-
-
-# ---------------------------------------------------------------------------
-# Helper: find the record closest to a given focus_index in a stack
-# ---------------------------------------------------------------------------
-
-def _find_nearest_record(
-    stack: List[AutofocusRecord],
-    target_focus: int,
-) -> AutofocusRecord:
-    """Return the record in *stack* whose focus_index is closest to
-    *target_focus*.  Ties are broken in favour of the lower index."""
-    best = stack[0]
-    best_dist = abs(best.focus_index - target_focus)
-    for rec in stack[1:]:
-        d = abs(rec.focus_index - target_focus)
-        if d < best_dist:
-            best = rec
-            best_dist = d
-    return best
-
-
-# ---------------------------------------------------------------------------
-# Algorithm 1  –  Fix overshooting / focus hunting
-# ---------------------------------------------------------------------------
-
-def algorithm1(
-    stack: List[AutofocusRecord],
-    n_steps: int,
-) -> List[ExpertTrajectory]:
-    """Generate expert trajectories by mirroring and re-sorting.
-
-    For every record in *stack* used as a starting position:
-      1. Select *n_steps + 1* positions from the stack (the initial
-         position plus *n_steps* subsequent ones, wrapping if needed).
-      2. For each position *k_j*, compute the mirrored position:
-             o_j = sign(k_0 - GT) · |k_j - GT| + GT
-         This "reflects" any position that overshot GT back across GT.
-      3. Clip each o_j to [min(k_0, GT), max(k_0, GT)].
-      4. Sort the resulting positions monotonically towards GT.
-      5. Derive actions as differences between consecutive positions.
-
-    Returns one trajectory per starting position in the stack.
-    """
-    gt = stack[0].gt_focus_index
-    trajectories: List[ExpertTrajectory] = []
-
-    for start_rec in stack:
-        k0 = start_rec.focus_index
-        if k0 == gt:
-            # Already at GT – trivial trajectory (all actions = 0)
-            traj = ExpertTrajectory(
-                scene_name=start_rec.scene_name,
-                patch_x=start_rec.patch_x,
-                patch_y=start_rec.patch_y,
-                gt_focus_index=gt,
-                algo_id=1,
-            )
-            for step_idx in range(n_steps + 1):
-                traj.steps.append(StepData(
-                    focus_index=gt,
-                    action=0,
-                    gt_focus_index=gt,
-                    scene_name=start_rec.scene_name,
-                    patch_x=start_rec.patch_x,
-                    patch_y=start_rec.patch_y,
-                    temperature=start_rec.temperature,
-                    left_raw_prefix=start_rec.left_raw_prefix,
-                    right_raw_prefix=start_rec.right_raw_prefix,
-                ))
-            trajectories.append(traj)
-            continue
-
-        sign_k0 = 1 if k0 > gt else -1
-
-        # Collect n_steps+1 positions from the stack (starting from k0)
-        # Use evenly-spaced indices in the stack for diversity.
-        n_total = n_steps + 1
-        indices = np.linspace(0, len(stack) - 1, n_total, dtype=int)
-        # Ensure the first one is the starting record
-        raw_positions = [k0]
-        for idx in indices[1:]:
-            raw_positions.append(stack[idx].focus_index)
-
-        # Step 2 & 3: mirror & clip
-        lo, hi = min(k0, gt), max(k0, gt)
-        mirrored = []
-        for kj in raw_positions:
-            oj = sign_k0 * abs(kj - gt) + gt
-            oj = max(lo, min(oj, hi))
-            mirrored.append(oj)
-
-        # Step 4: sort monotonically towards GT
-        reverse = k0 > gt  # descending if starting above GT
-        mirrored.sort(reverse=reverse)
-
-        # Step 5: build trajectory
-        traj = ExpertTrajectory(
-            scene_name=start_rec.scene_name,
-            patch_x=start_rec.patch_x,
-            patch_y=start_rec.patch_y,
-            gt_focus_index=gt,
-            algo_id=1,
-        )
-        for j in range(len(mirrored)):
-            fj = int(round(mirrored[j]))
-            fj = max(0, min(fj, NUM_FOCUS_POSITIONS - 1))
-            nearest_rec = _find_nearest_record(stack, fj)
-            if j < len(mirrored) - 1:
-                action = int(round(mirrored[j + 1])) - fj
-            else:
-                action = 0  # last step
-            traj.steps.append(StepData(
-                focus_index=fj,
-                action=action,
-                gt_focus_index=gt,
-                scene_name=nearest_rec.scene_name,
-                patch_x=nearest_rec.patch_x,
-                patch_y=nearest_rec.patch_y,
-                temperature=nearest_rec.temperature,
-                left_raw_prefix=nearest_rec.left_raw_prefix,
-                right_raw_prefix=nearest_rec.right_raw_prefix,
-            ))
-        trajectories.append(traj)
-
-    return trajectories
-
-
-# ---------------------------------------------------------------------------
-# Algorithm 2  –  Difficult / no-texture scenes (one-step-to-GT)
-# ---------------------------------------------------------------------------
-
-def algorithm2(
-    stack: List[AutofocusRecord],
-    n_steps: int,
-) -> List[ExpertTrajectory]:
-    """Generate expert trajectories: keep initial position, then jump to GT.
-
-    Trajectory:  k_0  →  GT  →  GT  →  ...  →  GT
-    Actions:     (GT-k_0), 0, 0, ..., 0
-    """
-    gt = stack[0].gt_focus_index
-    gt_rec = _find_nearest_record(stack, gt)
-    trajectories: List[ExpertTrajectory] = []
-
-    for start_rec in stack:
-        k0 = start_rec.focus_index
-        traj = ExpertTrajectory(
-            scene_name=start_rec.scene_name,
-            patch_x=start_rec.patch_x,
-            patch_y=start_rec.patch_y,
-            gt_focus_index=gt,
-            algo_id=2,
-        )
-        # Step 0: at k0, action = GT - k0
-        traj.steps.append(StepData(
-            focus_index=k0,
-            action=gt - k0,
-            gt_focus_index=gt,
-            scene_name=start_rec.scene_name,
-            patch_x=start_rec.patch_x,
-            patch_y=start_rec.patch_y,
-            temperature=start_rec.temperature,
-            left_raw_prefix=start_rec.left_raw_prefix,
-            right_raw_prefix=start_rec.right_raw_prefix,
-        ))
-        # Steps 1..n: at GT, action = 0
-        for _ in range(n_steps):
-            traj.steps.append(StepData(
-                focus_index=gt,
-                action=0,
-                gt_focus_index=gt,
-                scene_name=gt_rec.scene_name,
-                patch_x=gt_rec.patch_x,
-                patch_y=gt_rec.patch_y,
-                temperature=gt_rec.temperature,
-                left_raw_prefix=gt_rec.left_raw_prefix,
-                right_raw_prefix=gt_rec.right_raw_prefix,
-            ))
-        trajectories.append(traj)
-
-    return trajectories
-
-
-# ---------------------------------------------------------------------------
-# Algorithm 3  –  Smooth decaying approach
-# ---------------------------------------------------------------------------
-
-def algorithm3(
-    stack: List[AutofocusRecord],
-    n_steps: int,
-    m: int = 5,
-) -> List[ExpertTrajectory]:
-    """Generate expert trajectories with decaying step size.
-
-    Starting from k_0 with distance d = k_0 - GT:
-      • At each step j, d ← int(d / m), k_j = GT + d
-      • The last step lands exactly on GT.
-    Actions are the differences between consecutive positions.
-    """
-    gt = stack[0].gt_focus_index
-    trajectories: List[ExpertTrajectory] = []
-
-    for start_rec in stack:
-        k0 = start_rec.focus_index
-        d = k0 - gt
-
-        # Build position sequence
-        positions = [k0]
-        cur_d = d
-        for j in range(1, n_steps):
-            cur_d = int(cur_d / m)
-            kj = gt + cur_d
-            kj = max(0, min(kj, NUM_FOCUS_POSITIONS - 1))
-            positions.append(kj)
-        # Final step: land on GT
-        positions.append(gt)
-
-        # Trim or pad to exactly n_steps + 1
-        while len(positions) < n_steps + 1:
-            positions.append(gt)
-        positions = positions[: n_steps + 1]
-
-        # Build trajectory
-        traj = ExpertTrajectory(
-            scene_name=start_rec.scene_name,
-            patch_x=start_rec.patch_x,
-            patch_y=start_rec.patch_y,
-            gt_focus_index=gt,
-            algo_id=3,
-        )
-        for j in range(len(positions)):
-            fj = positions[j]
-            nearest_rec = _find_nearest_record(stack, fj)
-            action = (positions[j + 1] - fj) if j < len(positions) - 1 else 0
-            traj.steps.append(StepData(
-                focus_index=fj,
-                action=action,
-                gt_focus_index=gt,
-                scene_name=nearest_rec.scene_name,
-                patch_x=nearest_rec.patch_x,
-                patch_y=nearest_rec.patch_y,
-                temperature=nearest_rec.temperature,
-                left_raw_prefix=nearest_rec.left_raw_prefix,
-                right_raw_prefix=nearest_rec.right_raw_prefix,
-            ))
-        trajectories.append(traj)
-
-    return trajectories
-
-
-# ---------------------------------------------------------------------------
-# Public API – build all expert trajectories from TXT
-# ---------------------------------------------------------------------------
-
-def build_expert_trajectories(
-    txt_path: str,
-    n_steps: int = 4,
-    m: int = 5,
-    algo_mix: Sequence[int] = (1, 2, 3),
-) -> List[ExpertTrajectory]:
-    """Parse *txt_path* and generate expert trajectories with the selected
-    algorithms.
-
-    Parameters
-    ----------
-    txt_path : str
-        Path to the annotation TXT file.
-    n_steps : int
-        Maximum number of movement steps per trajectory (trajectory
-        length = n_steps + 1 including the initial position).
-    m : int
-        Division factor for Algorithm 3.
-    algo_mix : sequence of int
-        Which algorithms to include.  Default ``(1, 2, 3)`` generates
-        trajectories from all three algorithms and concatenates them.
-
-    Returns
-    -------
-    list of ExpertTrajectory
-    """
-    records = parse_txt(txt_path)
-    stacks = group_focal_stacks(records)
-
-    all_trajectories: List[ExpertTrajectory] = []
-    for _key, stack_records in stacks.items():
-        if 1 in algo_mix:
-            all_trajectories.extend(algorithm1(stack_records, n_steps))
-        if 2 in algo_mix:
-            all_trajectories.extend(algorithm2(stack_records, n_steps))
-        if 3 in algo_mix:
-            all_trajectories.extend(algorithm3(stack_records, n_steps, m=m))
-
-    return all_trajectories
-
-
-# ---------------------------------------------------------------------------
-# Trajectory → flat dataset for RL training
-# ---------------------------------------------------------------------------
-
-@dataclass
-class FlatStep:
-    """One (state-descriptor, expert_action) row ready for RL training."""
     focus_index: int
+    action: int
     gt_focus_index: int
-    expert_action: int
     scene_name: str
     patch_x: int
     patch_y: int
     temperature: float
     left_raw_prefix: str
     right_raw_prefix: str
-    step_in_traj: int
-    algo_id: int
 
 
-def trajectories_to_flat(
-    trajectories: List[ExpertTrajectory],
-) -> List[FlatStep]:
-    """Flatten a list of trajectories into individual step records.
+@dataclass
+class ExpertTrajectory:
+    scene_name: str
+    patch_x: int
+    patch_y: int
+    gt_focus_index: int
+    steps: List[StepData] = field(default_factory=list)
+    algo_id: int = 0
+    record_bank: Dict[int, StepData] = field(default_factory=dict, repr=False, compare=False)
 
-    Useful for building a ``torch.utils.data.Dataset`` that yields
-    (state, expert_action) pairs for expert regularisation.
-    """
-    flat: List[FlatStep] = []
+    @property
+    def positions(self) -> List[int]:
+        return [step.focus_index for step in self.steps]
+
+
+
+def _find_nearest_record(stack: List[AutofocusRecord], target_focus: int) -> AutofocusRecord:
+    return min(stack, key=lambda rec: abs(rec.focus_index - target_focus))
+
+
+def _find_nearest_focus(stack: List[AutofocusRecord], target_focus: int) -> int:
+    return _find_nearest_record(stack, target_focus).focus_index
+
+
+def _nearest_bank_step(record_bank: Dict[int, StepData], target_focus: int, fallback: StepData) -> StepData:
+    if not record_bank:
+        return fallback
+    if target_focus in record_bank:
+        return record_bank[target_focus]
+    nearest_focus = min(record_bank.keys(), key=lambda focus: abs(focus - target_focus))
+    return record_bank[nearest_focus]
+
+
+def build_state_from_record(
+    record: AutofocusRecord,
+    data_root: str,
+    patch_size: int = DEFAULT_PATCH_SIZE,
+    pe_dim: int = 16,
+    raw_suffix: str = ".npy",
+) -> Dict[str, torch.Tensor]:
+    left_path = os.path.join(data_root, record.left_raw_prefix + raw_suffix)
+    right_path = os.path.join(data_root, record.right_raw_prefix + raw_suffix)
+    left_image = load_raw_image(left_path)
+    right_image = load_raw_image(right_path)
+    left_patch = crop_patch(left_image, record.patch_x, record.patch_y, patch_size)
+    right_patch = crop_patch(right_image, record.patch_x, record.patch_y, patch_size)
+    left = _ensure_2d(normalise_patch(left_patch))
+    right = _ensure_2d(normalise_patch(right_patch))
+    image = torch.from_numpy(np.stack([left, right], axis=0)).float()
+    lens_pe = torch.from_numpy(lens_position_encoding(record.focus_index, embed_dim=pe_dim)).float()
+    roi_pe = torch.from_numpy(roi_position_encoding(record.patch_x, record.patch_y, embed_dim=pe_dim)).float()
+    temperature = torch.tensor([record.temperature], dtype=torch.float32)
+    return {
+        "image": image,
+        "lens_pe": lens_pe,
+        "roi_pe": roi_pe,
+        "temperature": temperature,
+    }
+
+
+
+def rollout_policy_trajectory(
+    model: AutofocusActorCritic,
+    stack: List[AutofocusRecord],
+    start_rec: AutofocusRecord,
+    data_root: str,
+    max_steps: int,
+    device: torch.device,
+    patch_size: int = DEFAULT_PATCH_SIZE,
+    pe_dim: int = 16,
+    raw_suffix: str = ".npy",
+    deterministic: bool = True,
+) -> ExpertTrajectory:
+    gt_focus = start_rec.gt_focus_index
+    current_focus = start_rec.focus_index
+    trajectory = ExpertTrajectory(
+        scene_name=start_rec.scene_name,
+        patch_x=start_rec.patch_x,
+        patch_y=start_rec.patch_y,
+        gt_focus_index=gt_focus,
+        algo_id=0,
+        record_bank={
+            rec.focus_index: StepData(
+                focus_index=rec.focus_index,
+                action=0,
+                gt_focus_index=rec.gt_focus_index,
+                scene_name=rec.scene_name,
+                patch_x=rec.patch_x,
+                patch_y=rec.patch_y,
+                temperature=rec.temperature,
+                left_raw_prefix=rec.left_raw_prefix,
+                right_raw_prefix=rec.right_raw_prefix,
+            )
+            for rec in stack
+        },
+    )
+
+    positions = [current_focus]
+    for _ in range(max_steps):
+        current_record = _find_nearest_record(stack, current_focus)
+        state = build_state_from_record(
+            current_record,
+            data_root=data_root,
+            patch_size=patch_size,
+            pe_dim=pe_dim,
+            raw_suffix=raw_suffix,
+        )
+        state = {key: value.unsqueeze(0).to(device) for key, value in state.items()}
+        with torch.no_grad():
+            logits = model.actor_logits(state)
+            dist = torch.distributions.Categorical(logits=logits)
+            action_index = logits.argmax(dim=-1) if deterministic else dist.sample()
+        offset = int(action_index.item()) - ACTION_RANGE
+        next_focus = int(np.clip(current_focus + offset, 0, NUM_FOCUS_POSITIONS - 1))
+        next_focus = _find_nearest_focus(stack, next_focus)
+        positions.append(next_focus)
+        current_focus = next_focus
+
+    for step_idx, focus_index in enumerate(positions):
+        rec = _find_nearest_record(stack, focus_index)
+        if step_idx < len(positions) - 1:
+            action = positions[step_idx + 1] - focus_index
+        else:
+            action = 0
+        trajectory.steps.append(
+            StepData(
+                focus_index=focus_index,
+                action=action,
+                gt_focus_index=gt_focus,
+                scene_name=rec.scene_name,
+                patch_x=rec.patch_x,
+                patch_y=rec.patch_y,
+                temperature=rec.temperature,
+                left_raw_prefix=rec.left_raw_prefix,
+                right_raw_prefix=rec.right_raw_prefix,
+            )
+        )
+    return trajectory
+
+
+
+def build_policy_trajectories(
+    txt_path: str,
+    data_root: str,
+    checkpoint_path: str,
+    max_steps: int = 4,
+    pe_dim: int = 16,
+    patch_size: int = DEFAULT_PATCH_SIZE,
+    raw_suffix: str = ".npy",
+    device: str = "cpu",
+    deterministic: bool = True,
+    imagenet_pretrained: bool = False,
+) -> List[ExpertTrajectory]:
+    model = AutofocusActorCritic(pe_dim=pe_dim, imagenet_pretrained=imagenet_pretrained)
+    model.load_phase1_weights(checkpoint_path, freeze_backbone=False, load_actor_head=True)
+    model.to(device)
+    model.eval()
+
+    stacks = group_focal_stacks(parse_txt(txt_path))
+    trajectories: List[ExpertTrajectory] = []
+    for stack in stacks.values():
+        for start_rec in stack:
+            trajectories.append(
+                rollout_policy_trajectory(
+                    model,
+                    stack,
+                    start_rec,
+                    data_root=data_root,
+                    max_steps=max_steps,
+                    device=torch.device(device),
+                    patch_size=patch_size,
+                    pe_dim=pe_dim,
+                    raw_suffix=raw_suffix,
+                    deterministic=deterministic,
+                )
+            )
+    return trajectories
+
+
+
+def algorithm1(original: ExpertTrajectory) -> ExpertTrajectory:
+    gt = original.gt_focus_index
+    positions = original.positions
+    k0 = positions[0]
+    if k0 == gt:
+        return algorithm2(original)
+    reflected = []
+    lower = min(k0, gt)
+    upper = max(k0, gt)
+    for position in positions:
+        mirrored = (1 if k0 > gt else -1) * abs(position - gt) + gt
+        mirrored = int(np.clip(mirrored, lower, upper))
+        reflected.append(mirrored)
+    reflected = sorted(reflected, reverse=(k0 > gt))
+    if len(reflected) != len(original.steps):
+        raise ValueError(
+            f"Algorithm 1 requires mirrored positions and original steps to have the same length "
+            f"(got {len(reflected)} vs {len(original.steps)})."
+        )
+
+    expert = ExpertTrajectory(
+        scene_name=original.scene_name,
+        patch_x=original.patch_x,
+        patch_y=original.patch_y,
+        gt_focus_index=gt,
+        algo_id=1,
+        record_bank=original.record_bank,
+    )
+    for index, step in enumerate(original.steps):
+        focus_index = reflected[index]
+        action = reflected[index + 1] - focus_index if index < len(reflected) - 1 else 0
+        bank_step = _nearest_bank_step(original.record_bank, focus_index, step)
+        expert.steps.append(
+            StepData(
+                focus_index=focus_index,
+                action=action,
+                gt_focus_index=gt,
+                scene_name=bank_step.scene_name,
+                patch_x=bank_step.patch_x,
+                patch_y=bank_step.patch_y,
+                temperature=bank_step.temperature,
+                left_raw_prefix=bank_step.left_raw_prefix,
+                right_raw_prefix=bank_step.right_raw_prefix,
+            )
+        )
+    return expert
+
+
+
+def algorithm2(original: ExpertTrajectory) -> ExpertTrajectory:
+    gt = original.gt_focus_index
+    k0 = original.steps[0].focus_index
+    expert = ExpertTrajectory(
+        scene_name=original.scene_name,
+        patch_x=original.patch_x,
+        patch_y=original.patch_y,
+        gt_focus_index=gt,
+        algo_id=2,
+        record_bank=original.record_bank,
+    )
+    for index, step in enumerate(original.steps):
+        focus_index = k0 if index == 0 else gt
+        action = (gt - k0) if index == 0 else 0
+        source_step = _nearest_bank_step(
+            original.record_bank,
+            focus_index,
+            original.steps[min(index, len(original.steps) - 1)],
+        )
+        expert.steps.append(
+            StepData(
+                focus_index=focus_index,
+                action=action,
+                gt_focus_index=gt,
+                scene_name=source_step.scene_name,
+                patch_x=source_step.patch_x,
+                patch_y=source_step.patch_y,
+                temperature=source_step.temperature,
+                left_raw_prefix=source_step.left_raw_prefix,
+                right_raw_prefix=source_step.right_raw_prefix,
+            )
+        )
+    return expert
+
+
+
+def algorithm3(original: ExpertTrajectory, m: int = 5) -> ExpertTrajectory:
+    gt = original.gt_focus_index
+    k0 = original.steps[0].focus_index
+    positions = [k0]
+    distance = k0 - gt
+    for _ in range(1, len(original.steps) - 1):
+        distance = int(distance / m)
+        positions.append(gt + distance)
+    positions.append(gt)
+    if len(positions) != len(original.steps):
+        raise ValueError(
+            f"Algorithm 3 requires generated positions and original steps to have the same length "
+            f"(got {len(positions)} vs {len(original.steps)})."
+        )
+
+    expert = ExpertTrajectory(
+        scene_name=original.scene_name,
+        patch_x=original.patch_x,
+        patch_y=original.patch_y,
+        gt_focus_index=gt,
+        algo_id=3,
+        record_bank=original.record_bank,
+    )
+    for index, step in enumerate(original.steps):
+        focus_index = int(np.clip(positions[index], 0, NUM_FOCUS_POSITIONS - 1))
+        action = positions[index + 1] - focus_index if index < len(positions) - 1 else 0
+        source_step = _nearest_bank_step(original.record_bank, focus_index, step)
+        expert.steps.append(
+            StepData(
+                focus_index=focus_index,
+                action=action,
+                gt_focus_index=gt,
+                scene_name=source_step.scene_name,
+                patch_x=source_step.patch_x,
+                patch_y=source_step.patch_y,
+                temperature=source_step.temperature,
+                left_raw_prefix=source_step.left_raw_prefix,
+                right_raw_prefix=source_step.right_raw_prefix,
+            )
+        )
+    return expert
+
+
+
+def generate_expert_trajectories(
+    originals: Iterable[ExpertTrajectory],
+    algo_mix: Sequence[int] = (1, 2, 3),
+    m: int = 5,
+) -> List[ExpertTrajectory]:
+    experts: List[ExpertTrajectory] = []
+    for original in originals:
+        if 1 in algo_mix:
+            experts.append(algorithm1(original))
+        if 2 in algo_mix:
+            experts.append(algorithm2(original))
+        if 3 in algo_mix:
+            experts.append(algorithm3(original, m=m))
+    return experts
+
+
+
+def save_trajectories_json(trajectories: Sequence[ExpertTrajectory], output_path: str) -> None:
+    payload = []
     for traj in trajectories:
-        for t, step in enumerate(traj.steps):
-            flat.append(FlatStep(
+        payload.append(
+            {
+                "scene_name": traj.scene_name,
+                "patch_x": traj.patch_x,
+                "patch_y": traj.patch_y,
+                "gt_focus_index": traj.gt_focus_index,
+                "algo_id": traj.algo_id,
+                "steps": [asdict(step) for step in traj.steps],
+            }
+        )
+    with open(output_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+
+
+
+def load_trajectories_json(json_path: str) -> List[ExpertTrajectory]:
+    with open(json_path, "r", encoding="utf-8") as handle:
+        raw = json.load(handle)
+    trajectories: List[ExpertTrajectory] = []
+    for traj_data in raw:
+        trajectories.append(
+            ExpertTrajectory(
+                scene_name=traj_data["scene_name"],
+                patch_x=traj_data["patch_x"],
+                patch_y=traj_data["patch_y"],
+                gt_focus_index=traj_data["gt_focus_index"],
+                algo_id=traj_data.get("algo_id", 0),
+                steps=[StepData(**step_data) for step_data in traj_data["steps"]],
+            )
+        )
+    return trajectories
+
+
+class ExpertTrajectoryDataset(Dataset):
+    def __init__(
+        self,
+        trajectories: Sequence[ExpertTrajectory],
+        data_root: str,
+        patch_size: int = DEFAULT_PATCH_SIZE,
+        pe_dim: int = 16,
+        raw_suffix: str = ".npy",
+    ) -> None:
+        self.trajectories = list(trajectories)
+        self.data_root = data_root
+        self.patch_size = patch_size
+        self.pe_dim = pe_dim
+        self.raw_suffix = raw_suffix
+
+    def __len__(self) -> int:
+        return len(self.trajectories)
+
+    def __getitem__(self, index: int):
+        trajectory = self.trajectories[index]
+        states = []
+        actions = []
+        for step in trajectory.steps:
+            record = AutofocusRecord(
+                scene_name=step.scene_name,
+                left_raw_prefix=step.left_raw_prefix,
+                right_raw_prefix=step.right_raw_prefix,
                 focus_index=step.focus_index,
                 gt_focus_index=step.gt_focus_index,
-                expert_action=step.action,
-                scene_name=step.scene_name,
                 patch_x=step.patch_x,
                 patch_y=step.patch_y,
                 temperature=step.temperature,
-                left_raw_prefix=step.left_raw_prefix,
-                right_raw_prefix=step.right_raw_prefix,
-                step_in_traj=t,
-                algo_id=traj.algo_id,
-            ))
-    return flat
+            )
+            states.append(
+                build_state_from_record(
+                    record,
+                    data_root=self.data_root,
+                    patch_size=self.patch_size,
+                    pe_dim=self.pe_dim,
+                    raw_suffix=self.raw_suffix,
+                )
+            )
+            actions.append(int(np.clip(step.action + ACTION_RANGE, 0, ACTION_DIM - 1)))
+        return states, torch.tensor(actions, dtype=torch.long)
 
 
-# ---------------------------------------------------------------------------
-# CLI convenience – build & save trajectories to disk
-# ---------------------------------------------------------------------------
 
-def main():
-    """Command-line interface for building expert trajectories."""
-    import argparse
-    import json
+def collate_expert_trajectories(batch):
+    images = []
+    lens_pe = []
+    roi_pe = []
+    temperature = []
+    actions = []
+    for states, traj_actions in batch:
+        for state, action in zip(states, traj_actions):
+            images.append(state["image"])
+            lens_pe.append(state["lens_pe"])
+            roi_pe.append(state["roi_pe"])
+            temperature.append(state["temperature"])
+            actions.append(action)
+    return {
+        "image": torch.stack(images),
+        "lens_pe": torch.stack(lens_pe),
+        "roi_pe": torch.stack(roi_pe),
+        "temperature": torch.stack(temperature),
+    }, torch.stack(actions)
 
-    parser = argparse.ArgumentParser(
-        description="Build offline expert trajectories from TXT annotation."
-    )
-    parser.add_argument("txt_path", help="Path to annotation TXT file.")
-    parser.add_argument(
-        "--n_steps", type=int, default=4,
-        help="Max movement steps per trajectory (default: 4)."
-    )
-    parser.add_argument(
-        "--m", type=int, default=5,
-        help="Division factor for Algorithm 3 (default: 5)."
-    )
-    parser.add_argument(
-        "--algos", type=str, default="1,2,3",
-        help="Comma-separated algorithm IDs to use (default: '1,2,3')."
-    )
-    parser.add_argument(
-        "--output", type=str, default="expert_trajectories.json",
-        help="Output JSON path."
-    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Build paper-faithful expert trajectories.")
+    parser.add_argument("--txt_path", required=True)
+    parser.add_argument("--data_root", required=True)
+    parser.add_argument("--policy_ckpt", required=True, help="Phase-1 checkpoint used to generate original trajectories.")
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--save_original_json", default=None)
+    parser.add_argument("--max_steps", type=int, default=4)
+    parser.add_argument("--m", type=int, default=5)
+    parser.add_argument("--algos", type=str, default="1,2,3")
+    parser.add_argument("--pe_dim", type=int, default=16)
+    parser.add_argument("--patch_size", type=int, default=128)
+    parser.add_argument("--raw_suffix", type=str, default=".npy")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--stochastic_policy", action="store_true")
     args = parser.parse_args()
 
-    algo_mix = [int(x) for x in args.algos.split(",")]
-    trajs = build_expert_trajectories(
-        args.txt_path, n_steps=args.n_steps, m=args.m, algo_mix=algo_mix,
+    algo_mix = [int(token) for token in args.algos.split(",") if token.strip()]
+    originals = build_policy_trajectories(
+        txt_path=args.txt_path,
+        data_root=args.data_root,
+        checkpoint_path=args.policy_ckpt,
+        max_steps=args.max_steps,
+        pe_dim=args.pe_dim,
+        patch_size=args.patch_size,
+        raw_suffix=args.raw_suffix,
+        device=args.device,
+        deterministic=not args.stochastic_policy,
     )
-
-    # Serialise
-    data = []
-    for traj in trajs:
-        traj_dict = {
-            "scene_name": traj.scene_name,
-            "patch_x": traj.patch_x,
-            "patch_y": traj.patch_y,
-            "gt_focus_index": traj.gt_focus_index,
-            "algo_id": traj.algo_id,
-            "steps": [
-                {
-                    "focus_index": s.focus_index,
-                    "action": s.action,
-                    "gt_focus_index": s.gt_focus_index,
-                    "temperature": s.temperature,
-                    "left_raw_prefix": s.left_raw_prefix,
-                    "right_raw_prefix": s.right_raw_prefix,
-                }
-                for s in traj.steps
-            ],
-        }
-        data.append(traj_dict)
-
-    with open(args.output, "w") as f:
-        json.dump(data, f, indent=2)
-    print(f"Saved {len(trajs)} expert trajectories to {args.output}")
+    experts = generate_expert_trajectories(originals, algo_mix=algo_mix, m=args.m)
+    if args.save_original_json:
+        save_trajectories_json(originals, args.save_original_json)
+    save_trajectories_json(experts, args.output)
+    print(f"Generated {len(experts)} expert trajectories from {len(originals)} original trajectories.")
+    print(f"Saved expert trajectories to {args.output}")
 
 
 if __name__ == "__main__":
